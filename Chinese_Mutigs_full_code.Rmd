@@ -1,0 +1,1544 @@
+---
+title: "Origimed_complete_code"
+output: html_document
+date: "2023-10-17"
+---
+
+# Setup 
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(musicatk)
+library(readxl)
+library(tidyverse) 
+library(gridExtra)
+library(modelsummary)
+library(ggpubr)
+library(rstatix)
+library(cowplot)
+library(ggrepel)
+
+```
+
+```{r Establish input filenames}
+
+# MSK files
+msk_mutations <- "data/MSK_impact/data_mutations_mskcc.txt"
+msk_annot <- "data/MSK_impact/data_clinical_sample.txt"
+msk_annot_extended <- "data/MSK_impact/data_extend.txt"
+msk_patient <- "data/MSK_impact/data_clinical_patient.txt"
+
+# Origimed files
+origimed_mutations <- "data/Origimed/data_mutations_extended.txt"
+origimed_sample_data <- "data/Origimed/data_clinical_sample.txt"
+origimed_patient_data <- "data/Origimed/data_clinical_patient.txt"
+
+# mapping MSK/OM cancer types
+cancer_type_correspond_table <- "data/MSK_OM_Cancer_Type_Correspond_Table_JDC.xlsm"
+
+# SigProfiler files
+sig_profiler_sigs <- "data/SigProfiler/sigprofiler_sigs.txt"
+sig_profiler_exposures <- "data/SigProfiler/sigprofiler_exposures.txt"
+
+```
+
+# Create musica objects for MSK and Origimed
+
+```{r Create MSK musica object}
+
+# extract variants
+msk <- extract_variants_from_maf_file(msk_mutations)
+
+# create muisca object 
+g <- select_genome("19")
+msk_musica <- create_musica_from_variants(msk, g, convert_dbs = FALSE)
+
+# build count tables
+build_standard_table(msk_musica, g, "SBS96")
+build_standard_table(msk_musica, g, "DBS78")
+build_standard_table(msk_musica, g, "IND83")
+
+```
+
+```{r Aggregate complete MSK annotation data}
+
+# sample anotations
+msk_annot <- read.table(msk_annot, sep = "\t", header = TRUE)
+msk_annot_extended <- read.table(msk_annot_extended, sep = "\t", header = TRUE) 
+
+# edit msk annotations manually to correct error
+msk1 <- msk_annot[1:1504,]
+msk2 <- msk_annot[1505:3327,]
+msk1[1504,16] <- "Wilms Tumor"
+msk_annot_extended[7618,16] <- "Wilms Tumor"
+msk_annot <- rbind(msk1, msk_annot_extended, msk2)
+
+# samples in MSK musica object
+samp_msk <- msk_musica@sample_annotations$Samples
+
+# subset msk_annot to include only samples found in MSK musica object
+samp1 <- msk_annot[match(samp_msk, msk_annot$SAMPLE_ID),]
+
+# create full annotations of tumor and patient data
+msk_patient <- read.delim(msk_patient, sep = "\t", header = TRUE, as.is = TRUE)
+samp_all <- cbind(samp1, msk_patient[match(samp1$PATIENT_ID, msk_patient$PATIENT_ID),-1])
+samp_all <- samp_all %>% rename("Samples" = "SAMPLE_ID")
+
+# save updated annotations to msk musica object
+msk_musica@sample_annotations <- samp_all
+
+```
+
+```{r Create origimed musica object}
+
+# extract variants
+ori <- extract_variants_from_maf_file(origimed_mutations)
+
+# select genome
+g <- select_genome("19")
+
+# create musica object
+om_musica <- create_musica_from_variants(ori, g, convert_dbs = FALSE)
+
+# build count tables
+build_standard_table(om_musica, g, "SBS96")
+build_standard_table(om_musica, g, "DBS78")
+build_standard_table(om_musica, g, "IND83")
+
+```
+
+```{r Aggreagate complete Origimed annotation data}
+
+# read in annotations
+om_annot <- read.delim(origimed_sample_data, header = TRUE)
+
+# reformat annotations
+colnames(om_annot) <- om_annot[4,]
+om_annot <- om_annot[-c(1:4),]
+
+# read in patient annotations
+om_annot_patient <- read.delim(origimed_patient_data, header = TRUE)
+
+# reformat annotations
+colnames(om_annot_patient) <- om_annot_patient[4,]
+om_annot_patient <- om_annot_patient[-c(1:4),]
+
+# complete origimed annotations
+om_full_annot <- cbind(om_annot, om_annot_patient[,-1])
+
+# retain annotations only for samples in the musica object
+annot_all <- om_full_annot[match(om_musica@sample_annotations$Samples, om_full_annot$SAMPLE_ID),]
+annot_all <- annot_all%>% rename("Samples" = "SAMPLE_ID")
+om_musica@sample_annotations <- annot_all
+
+```
+
+# Predict Origimed signature activities
+
+```{r Subset origimed musica}
+
+# remove samples with less than 10 mutations
+om_musica_10 <- subset_musica_by_counts(om_musica, "SBS96", 10)
+
+# cancer types with more than 5 samples
+ori_cancer_samp_num_10 <- om_musica_10@sample_annotations %>% group_by(CANCER_TYPE) %>% count() %>% filter(n >= 5)
+
+# remove cancer types with less than 5 samples
+om_musica_10_filter <- subset_musica_by_annotation(om_musica_10, annot_col = "CANCER_TYPE", annot_names = c(ori_cancer_samp_num_10$CANCER_TYPE))
+
+```
+
+```{r Update annotations of lung cancer types}
+
+# annotations of remaining samples
+annot_10_filter <- om_musica_10_filter@sample_annotations
+
+# Replace cancer type of non small cell lung cancer tumors with the detailed cancer type
+reps <- which(annot_10_filter$CANCER_TYPE == "Non Small Cell Lung Cancer")
+annot_10_filter[reps,]$CANCER_TYPE <- annot_10_filter[reps,]$CANCER_TYPE_DETAILED
+
+# replace cancer type of lung adenosquamous carcinoma with non small cell lung cancer other
+reps1 <- which(annot_10_filter$CANCER_TYPE == "Lung Adenosquamous Carcinoma")
+annot_10_filter[reps1,]$CANCER_TYPE <- stringr::str_replace_all(annot_10_filter[reps1,]$CANCER_TYPE, "Lung Adenosquamous Carcinoma" , "Non Small Cell Lung Cancer Other")
+
+# replace cancer type of large cell lung carcinoma with non small cell lung cancer other
+reps2 <- which(annot_10_filter$CANCER_TYPE == "Large Cell Lung Carcinoma")
+annot_10_filter[reps2,]$CANCER_TYPE <- stringr::str_replace_all(annot_10_filter[reps2,]$CANCER_TYPE, "Large Cell Lung Carcinoma" , "Non Small Cell Lung Cancer Other")
+
+# update musica object with these annotation changes
+om_musica_10_filter@sample_annotations <- annot_10_filter
+
+```
+
+```{r Subset COSMIC signatures to look for and remove cancer of unkown primary}
+
+# subset COSMIC signatures to use for analysis
+signature_to_use <- c("SBS1","SBS2","SBS4","SBS5","SBS6","SBS7","SBS10","SBS13","SBS15","SBS17","SBS18","SBS20","SBS21","SBS22","SBS24","SBS26")
+subset_cosmic <- cosmic_v2_sigs
+subset_cosmic@signatures <- subset_cosmic@signatures[, signature_to_use]
+
+# remove cancer of unknown primary from analysis
+subset_cancer <- unique(om_musica_10_filter@sample_annotations$CANCER_TYPE)[-10]
+om_musica_10_filter <- subset_musica_by_annotation(om_musica_10_filter, "CANCER_TYPE", annot_names = subset_cancer)
+
+```
+
+```{r Signature prediction}
+
+om_result <- withr::with_seed(1, auto_predict_grid(musica =  om_musica_10_filter, table_name = "SBS96",signature_res =  subset_cosmic, algorithm = "lda", sample_annotation = "CANCER_TYPE"))
+
+```
+
+# Construct bubble plot of signature activities (Figure 1)
+
+```{r aggregate signature activity data for each tumor type}
+
+exposures_select <- musicatk:::.pivot_exposures(exposures(om_result)) 
+
+all_annot_select <- samp_annot(om_result)
+final_table_select <- merge(all_annot_select, exposures_select, by.x = "Samples", by.y = "sample") %>% select(CANCER_TYPE, signature, exposure)
+average_exposure_select <- final_table_select %>% filter(exposure > 10) %>%
+  group_by(CANCER_TYPE, signature) %>% summarise(Total_Exposure_mean = median(exposure)/2.6) 
+
+tumor_number <- all_annot_select %>% select(CANCER_TYPE, Samples) %>% group_by(CANCER_TYPE) %>% count()
+proportion_select <- final_table_select%>%
+  group_by(CANCER_TYPE, signature) %>% summarise(proportion = sum(exposure > 10)/n()) 
+
+final_table_select1 <- average_exposure_select %>% full_join(proportion_select, by = c("CANCER_TYPE","signature"))
+
+final_table_select1[is.na(final_table_select1)] <- 0
+
+final_table_select1 <- merge(final_table_select1, tumor_number, by = "CANCER_TYPE")
+
+final_table_select1$cancer_label <- paste(final_table_select1$CANCER_TYPE, "(n =", final_table_select1$n, ")")
+
+```
+
+```{r bubble plot for signature activity across tumor types}
+
+# function to create bubble plot
+
+bubble_plot <- function(average_exposure_select) {
+  average_exposure_select$signature_num <- as.numeric(gsub("Signature", "", average_exposure_select$signature))
+  
+  average_exposure_select$signature <- gsub("Signature", "SBS", average_exposure_select$signature)
+  max_value <- max(average_exposure_select$Total_Exposure_mean, na.rm = TRUE)
+  # Reorder the signature factor based on the numerical part of the signature names
+  average_exposure_select <- average_exposure_select %>%
+  mutate(signature = factor(signature, levels = rev(unique(signature[order(signature_num)]))))
+
+  # Define the transformation function and its inverse
+  trans <- scales::trans_new(
+    name = "compressed",
+    transform = function(x) {
+      ifelse(x <= 20, x, 20 + 0.2 * (x - 20))
+    },
+    inverse = function(x) {
+      ifelse(x <= 20, x, 20 + 10 * (x - 20))
+    }
+  )
+
+  max_value <- max(average_exposure_select$Total_Exposure_mean, na.rm = TRUE)
+  
+  heatmap_circle_box <- ggplot(average_exposure_select, aes(x = cancer_label, y = signature)) +
+    geom_tile(fill = "white", color = "black") +
+    geom_point(aes(size =  ifelse(proportion == 0, NA, proportion), fill = Total_Exposure_mean), 
+               shape = 21, color = "black") + 
+    scale_size_continuous(name = "Proportion of tumors with\nsignature activity detected", range = c(0, 7)) +
+    scale_fill_gradientn(
+      name = "Signature activity / Mb",
+      trans = trans,
+      colors = c("white", "blue", "green", "orange", "red"),
+      values = scales::rescale(c(0, 5, 10,20, round(max_value))),
+      breaks = c(0, 5, 10, 20, round(max_value)),
+      labels = c("0", "5", "10", "20", as.character(round(max_value)))
+    ) +
+    labs(
+         x = "Cancer Type",
+         y = "Mutational Signature",
+         ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          panel.background = element_rect(fill = "grey95"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom")
+  
+  return(heatmap_circle_box)
+
+}
+
+```
+
+```{r final plot}
+
+bubble.plot <- bubble_plot(final_table_select1)
+bubble.plot
+ggsave(plot = bubble.plot, filename = "results/bubble_plot.pdf", width = 11, height = 9) 
+
+```
+
+# Analysis of SBS22 (Figure 2)
+
+```{r SBS22 Exposures}
+
+# tumor types to include
+tumor_types <- c("Liver Hepatocellular Carcinoma", "Intrahepatic Cholangiocarcinoma", "Extrahepatic Cholangiocarcinoma",
+                 "Kidney Renal Cell Carcinoma", "Urothelial Carcinoma", "Esophageal Carcinoma", "Soft Tissue Sarcoma")
+
+# subset musica object to those tumor types
+temp <- om_result
+temp@musica <- subset_musica_by_annotation(temp@musica, "CANCER_TYPE", tumor_types)
+temp@exposures <- temp@exposures[, as.character(samp_annot(temp)$Samples)]
+
+plot.22.expos <- plot_exposures(temp, sort_samples = "SBS22", same_scale = TRUE, annotation="CANCER_TYPE", group_by = "annotation", threshold = 0.00001) + 
+  theme(legend.position = c(0.65, 0.2), legend.direction = "horizontal",
+  strip.background = element_rect(fill = NA, color = "white"), text=element_text(family="sans")) +
+  guides(fill = guide_legend(ncol = 3)) +
+  ylab("Signature activity")
+
+plot.22.expos
+
+# zoomed in plot for esophageal
+
+temp <- om_result
+temp@musica <- subset_musica_by_annotation(temp@musica, "CANCER_TYPE", "Esophageal Carcinoma")
+temp@exposures <- temp@exposures[, as.character(samp_annot(temp)$Samples)]
+
+plot.eso.expos <- plot_exposures(temp, sort_samples = "SBS22", same_scale = TRUE, num_samples = 12, threshold = 0.00001)
+plot.eso.expos <- plot.eso.expos + theme(legend.position = "none") + 
+  theme(text = element_text(family="sans", size = 15), axis.title = element_blank())
+plot.eso.expos
+
+```
+
+```{r Mutation Profiles of SBS22 Samples}
+
+# determine top 2 liver samples
+temp <- om_result
+temp@musica <- subset_musica_by_annotation(temp@musica, "CANCER_TYPE", "Liver Hepatocellular Carcinoma")
+temp@exposures <- temp@exposures[, as.character(samp_annot(temp)$Samples)]
+sorted <- exposures(temp)[, order(-exposures(temp)[which(rownames(exposures(temp)) == 'Signature22'), ]) ]
+top_liver_sbs22 <- colnames(sorted)[c(1,2)]
+
+# determine top 3 soft tissue samples
+temp <- om_result
+temp@musica <- subset_musica_by_annotation(temp@musica, "CANCER_TYPE", "Soft Tissue Sarcoma")
+temp@exposures <- temp@exposures[, as.character(samp_annot(temp)$Samples)]
+sorted <- exposures(temp)[, order(-exposures(temp)[which(rownames(exposures(temp)) == 'Signature22'), ]) ]
+top_soft_sbs22 <- colnames(sorted)[c(1,2,3)]
+
+# determine top esophageal sample
+temp <- om_result
+temp@musica <- subset_musica_by_annotation(temp@musica, "CANCER_TYPE", "Esophageal Carcinoma")
+temp@exposures <- temp@exposures[, as.character(samp_annot(temp)$Samples)]
+sorted <- exposures(temp)[, order(-exposures(temp)[which(rownames(exposures(temp)) == 'Signature22'), ]) ]
+top_eso_sbs22 <- colnames(sorted)[c(1)]
+
+# calculate percent SBS22
+exposures <- as.data.frame(exposures(om_result))
+percent22_liver1 <- round((exposures$"P-9793"[10] / sum(exposures$"P-9793")) * 100, 1)
+percent22_liver2 <- round((exposures$"P-1863"[10] / sum(exposures$"P-1863")) * 100, 1)
+percent22_soft1 <- round((exposures$"P-3122"[10] / sum(exposures$"P-3122")) * 100, 1)
+percent22_soft2 <- round((exposures$"P-3125"[10] / sum(exposures$"P-3125")) * 100, 1)
+percent22_soft3 <- round((exposures$"P-1320"[10] / sum(exposures$"P-1320")) * 100, 1)
+percent22_eso1 <- round((exposures$"P-3796"[10] / sum(exposures$"P-3796")) * 100, 1)
+
+# annotations for plot
+annotations <- c(paste("Liver Heaptocellular Carcinoma\nSBS22: ", percent22_liver1, "% ", sep = ""), 
+                 paste("Liver Heaptocellular Carcinoma\nSBS22: ", percent22_liver2, "% ", sep = ""),
+                 paste("Soft Tissue Sarcoma\nSBS22: ", percent22_soft1, "% ", sep = ""), 
+                 paste("Soft Tissue Sarcoma\nSBS22: ", percent22_soft2, "% ", sep = ""), 
+                 paste("Soft Tissue Sarcoma\nSBS22: ", percent22_soft3, "% ", sep = ""),
+                 paste("Esophageal Carcinoma\nSBS22: ", percent22_eso1, "% ", sep = ""))
+
+
+
+# plot sample counts
+
+tab <- extract_count_tables(om_musica)
+tab <- tab$SBS96@count_table
+sample_names <- c("P-9793", "P-1863", "P-3122", "P-3125", "P-1320", "P-3796")
+ix <- match(sample_names, colnames(tab))
+sample_counts <- tab[, ix, drop = FALSE]
+result <- methods::new("musica_result",
+                        signatures = sample_counts, exposures = matrix(),
+                        algorithm = "sample", musica = om_musica,
+                        table_name = "SBS96")
+
+plot.sample.counts <- plot_signatures(result, text_size = 10,
+                     show_x_labels = TRUE, show_y_labels = FALSE,
+                     same_scale = FALSE, annotation = annotations) 
+
+plot.sample.counts
+
+```
+
+```{r Figure}
+
+sbs22.plots <- patchwork::wrap_elements(full = plot.22.expos) + (plot.sample.counts) + patchwork::plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(face = 'bold'))
+sbs22.plots
+ggsave(plot = sbs22.plots, filename = "results/SBS22_analysis.pdf", width = 13, height = 8) 
+
+```
+
+```{r Sex differences in SBS22 Urothelial carcinoma}
+
+annot.all <- samp_annot(om_musica)
+rownames(annot.all) <- annot.all$Samples
+
+e <- exposures(om_result)
+
+# Get annotation for current predictions
+annot <- annot.all[colnames(exposures(om_result)),]
+
+# Get index of all samples with complete clinical annotation
+ix = annot$CANCER_TYPE %in% c("Urothelial Carcinoma") & annot$AJCC_PATHOLOGIC_TUMOR_STAGE != "Unknown"
+
+# Set up predictor variables
+SBS22 <- log1p(e["SBS22",ix])
+Age <- scale(as.numeric(annot$`DIAGNOSIS AGE`[ix]))
+Sex <- factor(annot$SEX[ix], levels = c("Female", "Male"))
+Sample_Type <- factor(annot$SAMPLE_TYPE[ix], levels = c("Primary", "Metastasis"))
+Purity <- scale(as.numeric(annot$TUMOR_PURTITY[ix]))
+Stage <- as.factor(annot$AJCC_PATHOLOGIC_TUMOR_STAGE[ix])
+
+# Fit linear model
+model.uro <- lm(SBS22 ~ Purity + Stage + Age + Sample_Type + Sex) 
+summary(model.uro)
+
+# Create a model plot of coefficients
+pval.breaks <- c(0, 0.001, 0.01, 0.05, 1)
+pval.labels <- c("p < 0.001", "p < 0.01", "p < 0.05", "p > 0.05")
+plot.uro.model <- modelplot(model.uro, coef_omit="Intercept", coef_rename = TRUE, show.legend = TRUE) + 
+  theme_classic() + 
+  guides(color=guide_legend(title="P-value")) + 
+  theme(
+        legend.text = element_text(size = 6),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.5),
+        title = element_text(size = 8)) + 
+  aes(color = cut(x = p.value, breaks = pval.breaks, labels = pval.labels)) +
+  scale_color_manual(values = c("red", "red2", "red4", "black"), drop = FALSE) + 
+  geom_vline(xintercept = 0, color = 'grey', linetype = 2) +
+  xlab("Coefficients +/- 95% C.I.") + ggtitle("SBS22 - Urothelial Carcinoma")
+  
+plot.uro.model
+
+# create boxplot showing the different activity levels
+temp <- om_result
+samp_annot(temp, "CANCER_TYPE") <- annot[as.character(samp_annot(temp)$Sample), "CANCER_TYPE"]
+ix = annot$CANCER_TYPE %in% c("Urothelial Carcinoma") & annot$AJCC_PATHOLOGIC_TUMOR_STAGE != "Unknown"
+exposures(temp) <- exposures(temp)[,ix]
+rownames(temp@musica@sample_annotations) <- temp@musica@sample_annotations$Samples
+temp@musica@sample_annotations <- temp@musica@sample_annotations[colnames(exposures(temp)),]
+
+exposures(temp) <- as.matrix(exposures(temp)[which(rownames(exposures(temp)) == "SBS22"),])
+exposures(temp) <- t(exposures(temp))
+rownames(exposures(temp)) <- "SBS22"
+
+plot.uro.box <- plot_exposures(temp, plot_type = "box", group_by = "signature", color_by = "annotation", annotation = "SEX", label_x_axis = TRUE)
+plot.uro.box
+```
+
+```{r save Figure 2B-C}
+
+ggsave(plot = plot.uro.model, filename = "results/Figure2_B.pdf", width = 6.5, height = 3)
+ggsave(plot = plot.uro.box, filename = "results/Figure2_C.pdf", width = 4.5, height = 2.5)
+
+```
+
+# Generate combined Origimed/MSK musica object
+
+```{r Create combined Origimed/MSK musica object}
+
+# establish cancer groups
+ori_hepatobiliary <- c("Extrahepatic Cholangiocarcinoma","Gallbladder Carcinoma","Intrahepatic Cholangiocarcinoma", "Liver Hepatocellular Carcinoma")
+#ori_cancer_unsure <- c("Carcinoma of Uterine Cervix","Esophageal Carcinoma","Gastric Cancer","Kidney Renal Cell Carcinoma","Liver Hepatocellular Carcinoma","Urothelial Carcinoma", "Uterine Corpus Endometrial Carcinoma" )
+
+# save annotations
+msk_test <- msk_musica@sample_annotations #MSK
+mus_test <- om_musica@sample_annotations
+
+# rename origimed cancer types to match MSK
+reps <- which(mus_test$CANCER_TYPE_DETAILED == "Endometrial Adenocarcinoma")
+mus_test[reps,]$CANCER_TYPE <- "Endometrial Cancer"
+
+reps1 <- which(mus_test$CANCER_TYPE == "Carcinoma of Uterine Cervix")
+mus_test[reps1,]$CANCER_TYPE <- "Cervical Cancer" 
+
+reps2 <- which(mus_test$CANCER_TYPE %in% ori_hepatobiliary)
+mus_test[reps2,]$CANCER_TYPE <- "Hepatobiliary Cancer"
+
+reps3 <- which(mus_test$CANCER_TYPE %in% c("Esophageal Carcinoma", "Gastric Cancer"))
+mus_test[reps3,]$CANCER_TYPE <- "Esophagogastric Cancer"
+
+reps4 <- which(mus_test$CANCER_TYPE == "Kidney Renal Cell Carcinoma")
+mus_test[reps4,]$CANCER_TYPE <- "Renal Cell Carcinoma"
+
+reps5 <- which(mus_test$CANCER_TYPE == "Urothelial Carcinoma")
+mus_test[reps5,]$CANCER_TYPE <- "Bladder Cancer"
+
+reps6 <- which(mus_test$CANCER_TYPE == "Uterine Corpus Endometrial Carcinoma")
+mus_test[reps6,]$CANCER_TYPE <- "Endometrial Cancer"
+
+# lists of unique cancer types
+ori_type <- unique(mus_test$CANCER_TYPE)
+msk_type <- unique(msk_test$CANCER_TYPE)
+
+# make terminology consistent between origimed and MSK
+reps7 <- which(stringr::str_replace_all(msk_test$CANCER_TYPE, "Cancer", "Carcinoma") %in% ori_type)
+msk_test[reps7,]$CANCER_TYPE <- stringr::str_replace_all(msk_test[reps7,]$CANCER_TYPE, "Cancer", "Carcinoma")
+
+reps8 <- which(stringr::str_replace_all(msk_test$CANCER_TYPE, "Cancer", "Sarcoma") %in% ori_type)
+msk_test[reps8,]$CANCER_TYPE <- stringr::str_replace_all(msk_test[reps8,]$CANCER_TYPE, "Cancer", "Sarcoma")
+
+msk_test$CANCER_TYPE <- stringr::str_replace_all(msk_test$CANCER_TYPE, "-", " ")
+
+# lists of unique cancer types
+ori_type <- unique(mus_test$CANCER_TYPE)
+msk_type <- unique(msk_test$CANCER_TYPE)
+
+# find common cancer types
+reps9 <- which(msk_type %in%ori_type)
+common <- msk_type[reps9]
+
+# origimed musica object with only common cancer types
+mus_common <- om_musica
+mus_common@sample_annotations <- mus_test
+mus_common <- subset_musica_by_annotation(mus_common, annot_col = "CANCER_TYPE", annot_names = c(common))
+#mus_common_10 <- subset_musica_by_counts(mus_common, "SBS96",10)
+
+# MSK musica object with only common cancer types
+msk_common <- msk_musica
+msk_common@sample_annotations <- msk_test
+msk_common <- subset_musica_by_annotation(msk_common, annot_col = "CANCER_TYPE", annot_names = c(common))
+#msk_common_10 <- subset_musica_by_counts(msk_common, "SBS96", 10)
+
+# add annotation for cohort
+mus_common@sample_annotations$Cohort <- "Origimed"
+msk_common@sample_annotations$Cohort <- "MSK"
+
+# subset annotation table
+mus_common@sample_annotations  <- mus_common@sample_annotations %>% select(Samples, CANCER_TYPE, CANCER_TYPE_DETAILED, Cohort)
+msk_common@sample_annotations  <- msk_common@sample_annotations %>% select(Samples, CANCER_TYPE, CANCER_TYPE_DETAILED, Cohort)
+
+# create musica object with both cohorts and filter for 10 counts
+combined <- mus_common
+combined@variants <- rbind(mus_common@variants, msk_common@variants)
+combined@sample_annotations <- rbind(mus_common@sample_annotations, msk_common@sample_annotations)
+build_standard_table(combined, g, "SBS96", overwrite = TRUE)
+combined_subset_10 <- subset_musica_by_counts(combined, "SBS96", 10)
+
+```
+
+
+```{r Adjust lung cancer annotations}
+
+# extract non small cell lung cancer types
+nscl <- subset_musica_by_annotation(combined_subset_10, annot_col = "CANCER_TYPE", annot_names = "Non Small Cell Lung Cancer")
+nscl <- nscl@sample_annotations
+nscl_cancer_type <- unique(nscl$CANCER_TYPE_DETAILED)
+k <- nscl_cancer_type[c(-1,-2)]
+
+# use detailed cancer types for non small cell lung cancers
+reps <- which(combined_subset_10@sample_annotations$CANCER_TYPE == "Non Small Cell Lung Cancer")
+combined_subset_10@sample_annotations[reps,]$CANCER_TYPE <- combined_subset_10@sample_annotations[reps,]$CANCER_TYPE_DETAILED
+
+# Replace lung adenosquamous carcinoma labels with non small cell lung cancer other
+reps1 <- which(combined_subset_10@sample_annotations$CANCER_TYPE == "Lung Adenosquamous Carcinoma")
+combined_subset_10@sample_annotations[reps1,]$CANCER_TYPE <- stringr::str_replace_all(combined_subset_10@sample_annotations[reps1,]$CANCER_TYPE, "Lung Adenosquamous Carcinoma" , "Non Small Cell Lung Cancer Other")
+
+# replace large cell lung carcinoma with non small cell lung cancer other
+reps2 <- which(combined_subset_10@sample_annotations$CANCER_TYPE == "Large Cell Lung Carcinoma")
+combined_subset_10@sample_annotations[reps2,]$CANCER_TYPE <- stringr::str_replace_all(combined_subset_10@sample_annotations[reps2,]$CANCER_TYPE, "Large Cell Lung Carcinoma" , "Non Small Cell Lung Cancer Other")
+
+# replace poorly differentiated non-small cell lung cancer with non small cell lung cancer other
+reps3 <- which(combined_subset_10@sample_annotations$CANCER_TYPE == "Poorly Differentiated Non-Small Cell Lung Cancer")
+combined_subset_10@sample_annotations[reps3,]$CANCER_TYPE <- stringr::str_replace_all(combined_subset_10@sample_annotations[reps3,]$CANCER_TYPE,  "Poorly Differentiated Non-Small Cell Lung Cancer", "Non Small Cell Lung Cancer Other")
+
+# replace non small cell lung cancer with non small cell lung cancer other
+reps4 <- which(combined_subset_10@sample_annotations$CANCER_TYPE == "Non-Small Cell Lung Cancer")
+combined_subset_10@sample_annotations[reps4,]$CANCER_TYPE <- stringr::str_replace_all(combined_subset_10@sample_annotations[reps4,]$CANCER_TYPE,  "Non-Small Cell Lung Cancer", "Non Small Cell Lung Cancer Other")
+
+
+for (i in k) {
+  reps <- which(combined_subset_10@sample_annotations$CANCER_TYPE == i)
+  combined_subset_10@sample_annotations[reps,]$CANCER_TYPE <- stringr::str_replace_all(combined_subset_10@sample_annotations[reps,]$CANCER_TYPE, i , "Non Small Cell Lung Cancer Other")
+}
+
+```
+
+```{r}
+
+MSK_OM <- read_excel(cancer_type_correspond_table)
+
+# typo correction
+MSK_OM[6,5] <- "Stomach Adenocarcinoma"
+
+MSK_original <- MSK_OM %>%
+  separate_rows(MSK_DETAILED_TYPES, sep = ",\\s*")
+
+OM_MSK_Original <- MSK_original %>%
+  separate_rows(OM_DETAILED_TYPES, sep = ",\\s*")
+
+# unique detailed cancer types
+MSK_OM_detail <- c(OM_MSK_Original$OM_DETAILED_TYPES, OM_MSK_Original$MSK_DETAILED_TYPES) %>% unique()
+
+```
+
+
+```{r Adjust cancer type annotations between origimed and MSK and filter}
+
+# Adjust cancer type annotations
+
+reps <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Renal Clear Cell Carcinoma")
+combined_subset_10@sample_annotations[reps,]$CANCER_TYPE <- "Renal Clear Cell Carcinoma"
+  
+reps1 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Gastric Adenocarcinoma")
+combined_subset_10@sample_annotations[reps1,]$CANCER_TYPE <- "Gastric Adenocarcinoma"
+
+reps2 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Stomach Adenocarcinoma")
+combined_subset_10@sample_annotations[reps2,]$CANCER_TYPE <- "Gastric Adenocarcinoma"
+
+reps3 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Pancreatic Adenocarcinoma")
+combined_subset_10@sample_annotations[reps3,]$CANCER_TYPE <- "Pancreatic Adenocarcinoma"
+
+reps4 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Extrahepatic Cholangiocarcinoma")
+combined_subset_10@sample_annotations[reps4,]$CANCER_TYPE <- "Extrahepatic Cholangiocarcinoma"
+
+reps5 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Esophageal Squamous Cell Carcinoma")
+combined_subset_10@sample_annotations[reps5,]$CANCER_TYPE <- "Esophageal Squamous Cell Carcinoma"
+
+reps6 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "High-Grade Serous Ovarian Cancer")
+combined_subset_10@sample_annotations[reps6,]$CANCER_TYPE <- "High-Grade Serous Ovarian Cancer"
+
+reps7 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Intrahepatic Cholangiocarcinoma")
+combined_subset_10@sample_annotations[reps7,]$CANCER_TYPE <- "Intrahepatic Cholangiocarcinoma"
+
+reps8 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Uterine Endometrioid Carcinoma")
+combined_subset_10@sample_annotations[reps8,]$CANCER_TYPE <- "Uterine Endometrioid Carcinoma"
+
+reps9 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Gallbladder Adenocarcinoma")
+combined_subset_10@sample_annotations[reps9,]$CANCER_TYPE <- "Gallbladder Carcinoma"
+
+reps10 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Gallbladder Cancer")
+combined_subset_10@sample_annotations[reps10,]$CANCER_TYPE <- "Gallbladder Carcinoma"
+
+reps11 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Cervical Squamous Cell Carcinoma")
+combined_subset_10@sample_annotations[reps11,]$CANCER_TYPE <- "Cervical Squamous Cell Carcinoma"
+
+reps12 <- which(combined_subset_10@sample_annotations$CANCER_TYPE_DETAILED == "Liver Hepatocellular Carcinoma")
+combined_subset_10@sample_annotations[reps12,]$CANCER_TYPE <- "Hepatocellular Carcinoma"
+
+MSK_OM[18,1] <- "Lung Adenocarcinoma"
+
+combined_subset_10_select <- subset_musica_by_annotation(combined_subset_10, annot_col = "CANCER_TYPE", annot_names = MSK_OM$ID)
+combined_subset_10_select <- subset_musica_by_annotation(combined_subset_10_select, annot_col = "CANCER_TYPE_DETAILED", annot_names = MSK_OM_detail)
+
+# get number of samples for each tumor type in both cohorts
+s <- combined_subset_10_select@sample_annotations
+sample_count <-  s %>% group_by(CANCER_TYPE, Cohort) %>% count() %>% filter(n > 5)
+
+MSK <- sample_count %>% filter(Cohort == "MSK")
+OM <- sample_count %>% filter(Cohort == "Origimed")
+
+# cancer types found in both
+both <- intersect(MSK$CANCER_TYPE, OM$CANCER_TYPE)
+
+# create musica object for combined
+combined_subset_10_select_filter <- subset_musica_by_annotation(combined_subset_10_select, annot_col = "CANCER_TYPE", annot_names = both )
+
+```
+
+```{r manually add hepatocellular cancer}
+
+liver_mus <- subset_musica_by_annotation(combined, annot_col = "CANCER_TYPE", annot_names = "Hepatobiliary Cancer")
+
+liver_annot <- liver_mus@sample_annotations
+
+reps1 <- which(liver_mus@sample_annotations$CANCER_TYPE_DETAILED == "Hepatocellular Carcinoma")
+liver_mus@sample_annotations[reps1,]$CANCER_TYPE <- 
+  "Hepatocellular Carcinoma"
+
+reps2 <- which(liver_mus@sample_annotations$CANCER_TYPE_DETAILED == "Liver Hepatocellular Carcinoma")
+liver_mus@sample_annotations[reps2,]$CANCER_TYPE <- 
+  "Hepatocellular Carcinoma"
+
+liver_mus <- subset_musica_by_annotation(liver_mus, annot_col = "CANCER_TYPE", annot_names = "Hepatocellular Carcinoma")
+liver_mus_5 <- subset_musica_by_counts(liver_mus,"SBS96",5)
+
+combined_subset_10_select_filter@variants <- rbind(combined_subset_10_select_filter@variants, liver_mus_5@variants)
+combined_subset_10_select_filter@sample_annotations <- rbind(combined_subset_10_select_filter@sample_annotations, liver_mus_5@sample_annotations)
+build_standard_table(combined_subset_10_select_filter, g, "SBS96", overwrite = TRUE)
+
+```
+
+
+# MSK vs Origimed comparison (Figure 3)
+
+```{r predict signature activities}
+
+common_grid_10_v2_new <- withr::with_seed(1, auto_predict_grid(combined_subset_10_select_filter, table_name = "SBS96",   signature_res = subset_cosmic, algorithm = "lda", sample_annotation = "CANCER_TYPE"))
+
+```
+
+```{r construct plots}
+
+all_annot <- samp_annot(common_grid_10_v2_new)
+types <- unique(all_annot$CANCER_TYPE)
+
+prop_mat <- function(mat) {
+  return(apply(mat, 2, function(x) x/sum(x)))
+}
+
+plot_dat <- function(cur) {
+  ind1 <- which(colnames(exposures(common_grid_10_v2_new)) %in% 
+                  all_annot$Samples[all_annot$CANCER_TYPE == types[cur] & 
+                                      all_annot$Cohort == "MSK"])
+  ind2 <- which(colnames(exposures(common_grid_10_v2_new)) %in% 
+                  all_annot$Samples[all_annot$CANCER_TYPE == types[cur] & 
+                                      all_annot$Cohort == "Origimed"])
+  populated <- union(which(rowSums(prop_mat(exposures(common_grid_10_v2_new))[, ind1]) > 0), 
+                     which(rowSums(prop_mat(exposures(common_grid_10_v2_new))[, ind2]) > 0))
+  intermediate1 <- prop_mat(exposures(common_grid_10_v2_new))[, ind1][populated, ]
+  intermediate2 <- prop_mat(exposures(common_grid_10_v2_new))[, ind2][populated, ]
+  test1 <- rbind(cbind(musicatk:::.pivot_exposures(intermediate1), Cohort = "MSK"), 
+                 cbind(musicatk:::.pivot_exposures(intermediate2), Cohort = "Origimed")) %>%
+    dplyr::group_by(signature)
+  signature <- test1 %>% group_by(signature, Cohort) %>% 
+    summarise(median_exposure = median(exposure)) %>% filter(median_exposure > 0.01)
+  reps <- which(test1$signature %in% signature$signature)
+  test1 <- test1[reps,]
+  sigs <- unique(test1$signature)
+  wilcox <- rep(NA, length(sigs))
+  for(j in seq_along(sigs)) {
+    test1 %>% dplyr::filter(signature == sigs[j]) -> test2
+    wilcox[j] <- wilcox.test(test2$exposure[which(test2$Cohort == "MSK")], 
+                             test2$exposure[which(test2$Cohort == "Origimed")], "two.sided")$p.value
+  }
+  
+  test1 %>%
+    dplyr::group_by(Cohort, signature) %>% dplyr::summarize(median = median(exposure)) %>%
+    tidyr::spread(Cohort, median) %>% cbind(tumor_type = types[cur]) %>% cbind(wilcox_pval = wilcox)
+}
+
+all_plot_dat <- rbind(plot_dat(1),plot_dat(2),plot_dat(3), plot_dat(4), plot_dat(5), plot_dat(6), plot_dat(7), plot_dat(8),plot_dat(9), plot_dat(10), plot_dat(11), plot_dat(12), plot_dat(13))
+
+all_plot_dat$wilcox_pval_fdr <- p.adjust(all_plot_dat$wilcox_pval, method="fdr")
+
+all_plot_dat <- all_plot_dat%>%
+  mutate(SBS = str_replace(signature, "Signature", "SBS"))
+
+all_plot_dat <- all_plot_dat %>%
+  mutate(Significance = wilcox_pval_fdr < 0.05)
+all_plot_dat <- all_plot_dat%>% mutate(Significance = str_replace(Significance, "FALSE", "FDR >= 0.05"))
+all_plot_dat <- all_plot_dat %>% mutate(Significance = str_replace(Significance, "TRUE", "FDR < 0.05"))
+
+final_table_comparison <- all_plot_dat %>% select(signature, tumor_type, Origimed, MSK, wilcox_pval, wilcox_pval_fdr)
+
+final_table <- final_table_comparison %>% rename(Signature = signature, `Tumor Type` = tumor_type, `Median in OM` = Origimed, `Meidan in MSK` = MSK, `Wilcoxon P-value` = wilcox_pval, `Wilcoxon FDR` = wilcox_pval_fdr)
+
+all_plot_dat %>%
+  ggplot(aes(x = MSK, y = Origimed, color = tumor_type, label = SBS, shape = Significance)) +
+  ggplot2::geom_point(size = 1) + 
+  geom_text_repel(size = 2, point.padding = 0, box.padding = 0.05, show.legend = FALSE) +
+  theme_bw(base_size = 5) +  # adjust base size for all text
+  theme(
+    plot.margin=unit(c(0,4,0,0),"cm"),
+
+      # adjust axis text size
+    axis.title = element_text(size = 8),   # adjust axis title size
+    axis.text = element_text(size = 6),    # adjust axis text size
+    plot.title = element_text(size = 9),   # adjust plot title size
+    legend.text = element_text(size = 6),  # adjust legend text size
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(0.25, "cm"),
+    legend.position = "none"              # adjust legend title size
+  )  + 
+  scale_shape_manual(values = c("FDR >= 0.05" = 16, "FDR < 0.05" = 15)) +
+  geom_abline(slope=1)  + 
+  scale_color_discrete(name = "Tumor Type") +
+  xlab("American cohort (MSK)") +
+  ylab("Chinese cohort (OM)")+
+  ggtitle("Median proportional signature activity")-> summary_plot
+
+summary_plot
+
+```
+
+```{r construct plots}
+
+plot_fisher <- function(cur){
+  ind1 <- which(colnames(exposures(common_grid_10_v2_new)) %in% 
+                  all_annot$Samples[all_annot$CANCER_TYPE == types[cur] & 
+                                      all_annot$Cohort == "MSK"])
+  ind2 <- which(colnames(exposures(common_grid_10_v2_new)) %in% 
+                  all_annot$Samples[all_annot$CANCER_TYPE == types[cur] & 
+                                      all_annot$Cohort == "Origimed"])
+  populated <- union(which(rowSums(prop_mat(exposures(common_grid_10_v2_new))[, ind1]) > 0), 
+                     which(rowSums(prop_mat(exposures(common_grid_10_v2_new))[, ind2]) > 0))
+  intermediate1 <- exposures(common_grid_10_v2_new)[, ind1][populated, ]
+  intermediate2 <- exposures(common_grid_10_v2_new)[, ind2][populated, ]
+
+  test1 <- rbind(cbind(musicatk:::.pivot_exposures(intermediate1), Cohort = "MSK"), 
+                 cbind(musicatk:::.pivot_exposures(intermediate2), Cohort = "Origimed")) %>% 
+    group_by(Cohort, signature)
+  
+  test1$CANCER_TYPE <- rep(types[cur], nrow(test1))
+  test2 <- test1 %>% group_by(Cohort, signature) %>% 
+    mutate(total = n(), n = sum(exposure > 10))  %>% 
+    select(signature, Cohort, n, total, CANCER_TYPE) %>% 
+    unique() %>% 
+    mutate(proportion = n/total)
+  data_n <- test2 %>%
+    select(signature, n, Cohort) %>%
+    pivot_wider(names_from = Cohort, values_from = n, 
+              names_prefix = "n_", values_fill = 0)
+
+  # Pivoting 'total' values (assuming they're the same for each signature)
+  data_total <- test2 %>%
+    select(signature,total, Cohort, CANCER_TYPE) %>%
+    distinct() %>%
+    pivot_wider(names_from = Cohort, values_from = total, 
+                names_prefix = "total_", values_fill = 0)
+  
+  # Joining the pivoted data together
+  final_data <- left_join(data_n, data_total, by = "signature")
+  p_value <- c()
+  odd_ratio <- c()
+  results <- data.frame()
+
+  for(i in 1:nrow(final_data)) {
+    # Create a matrix for Fisher's test
+    mat <- matrix(c(final_data$n_MSK[i], final_data$total_MSK[i] - final_data$n_MSK[i], 
+                    final_data$n_Origimed[i], final_data$total_Origimed[i] - final_data$n_Origimed[i]), 
+                  nrow = 2)
+    
+    # Perform Fisher's exact test
+    test_result <- fisher.test(mat)
+    p_value[i] <- test_result$p.value
+    odd_ratio[i] <- test_result$estimate
+    
+    # Store results
+    results <- rbind(results, data.frame(Signature = final_data$signature[i],
+                                         `Tumor Types` = final_data$CANCER_TYPE[i],
+                                         `MSK proportion` = final_data$n_MSK[i]/final_data$total_MSK[i],
+                                         MSK = final_data$n_MSK[i],
+                                         `MSK Total` = final_data$total_MSK,
+                                         `OM proportion` = final_data$n_Origimed[i]/final_data$total_Origimed[i],
+                                         OM = final_data$n_Origimed[i],
+                                         `OM Total` = final_data$total_Origimed[i],
+                                         `Odd Ratio` = odd_ratio[i],
+                                         `Fisher P_value` = p_value[i]))
+  }
+
+  # View results
+  results
+  
+}
+
+fisher_table <- rbind(plot_fisher(1),plot_fisher(2),plot_fisher(3),plot_fisher(4),plot_fisher(5),plot_fisher(6),plot_fisher(7),plot_fisher(8),plot_fisher(9),plot_fisher(10),plot_fisher(11),plot_fisher(12), plot_fisher(13)) %>% distinct()
+
+
+fisher_table$Fisher_fdr <- p.adjust(fisher_table$Fisher.P_value, method="fdr")
+fisher_table <- fisher_table%>% mutate(SBS = str_replace(Signature, "Signature", "SBS"))
+
+fisher_table <- fisher_table %>%
+  mutate(Significance = Fisher_fdr < 0.05)
+fisher_table <- fisher_table %>% 
+  mutate(Significance = str_replace(Significance, "FALSE", "FDR >= 0.05"))
+
+fisher_table <- fisher_table %>% mutate(Significance = str_replace(Significance, "TRUE", "FDR < 0.05"))
+
+
+final_fisher_table <- fisher_table %>% select(-Significance, -SBS)
+
+final_fisher_table <- final_fisher_table %>% 
+  rename( `Tumor Type` = Tumor.Types, `Count in OM` = OM, `Count in MSK` = MSK, 
+          `MSK Proportion` = MSK.proportion, `OM Proportion` = OM.proportion, 
+          `MSK Total` = MSK.Total, `OM Total` = OM.Total, `Odd Ratio` = Odd.Ratio, 
+          `Fisher P_value` = Fisher.P_value, `Fisher FDR` = Fisher_fdr)
+
+
+fisher_table %>%
+  ggplot(aes(x = MSK.proportion, y = OM.proportion, color = Tumor.Types, label = SBS, shape = Significance)) +
+  ggplot2::geom_point(size = 1) + 
+  geom_text_repel(size = 2, point.padding = 0, box.padding = 0.05, show.legend = FALSE) +
+  theme_bw(base_size = 5) +  # adjust base size for all text
+  theme(
+      # adjust axis text size
+    axis.title = element_text(size = 8),  # adjust axis title size
+    axis.text = element_text(size = 6),    # adjust axis text size
+    plot.title = element_text(size = 9),  # adjust plot title size
+    legend.text = element_text(size = 6),  # adjust legend text size
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(0.25, "cm"),
+    legend.position = "none",
+    # adjust legend title size
+  )  + 
+  geom_abline(slope=1) + 
+  scale_shape_manual(values = c("FDR >= 0.05" = 16, "FDR < 0.05" = 15)) +
+  scale_color_discrete(name = "Tumor Type") + 
+  xlab("American cohort (MSK)")+
+  ylab("Chinese cohort (OM)") +
+  ggtitle("Proportion of tumors with detected signature")-> summary_plot1
+
+summary_plot1
+
+```
+
+```{r final plot}
+
+final_plot <- patchwork::wrap_plots(summary_plot1, (summary_plot + theme(legend.position = c(1.3,0.6)))) + patchwork::plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(face = 'bold', size = 10))
+final_plot
+ggsave("results/OM_MSK_comparison.pdf", final_plot, width = 8, height = 3.5, dpi = 5000)
+
+```
+
+# Analysis of SBS4 (Figure 4)
+
+```{r process_variants_in_gene}
+
+mut <- read.delim(origimed_mutations, header=TRUE, sep = "\t")
+
+# Filter to nonsynonymous mutations
+nonsyn.types <- c("Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins", "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation", "Translation_Start_Site", "Splice_Site", "De_novo_Start_InFrame", "De_novo_Start_OutOfFrame", "Stop_Codon_Del", "Stop_Codon_Ins", "Start_Codon_Del", "Start_Codon_Ins", "Splice_Region")
+mut.nonsyn <- mut[mut$Variant_Classification %in% nonsyn.types,]
+
+# Count the number of mutations for each gene in each sample
+mut.table <- xtabs(~ Hugo_Symbol + Tumor_Sample_Barcode, data = mut.nonsyn)
+
+```
+
+
+```{r lung_adeno_sbs4_exposures}
+
+annot.all <- samp_annot(om_musica)
+rownames(annot.all) <- annot.all$Samples
+
+e <- exposures(om_result)
+
+# Get annotation for current predictions
+annot <- annot.all[colnames(exposures(om_result)),]
+
+temp <- om_result
+samp_annot(temp, "CANCER_TYPE_DETAILED") <- annot[as.character(samp_annot(temp)$Sample), "CANCER_TYPE_DETAILED"]
+ix <-annot$CANCER_TYPE_DETAILED %in% c("Lung Adenocarcinoma", "Lung Squamous Cell Carcinoma", "Small Cell Lung Cancer")
+exposures(temp) <- exposures(temp)[,ix]
+rownames(temp@musica@sample_annotations) <- temp@musica@sample_annotations$Samples
+temp@musica@sample_annotations <- temp@musica@sample_annotations[colnames(exposures(temp)),]
+
+# Create exposure barplot
+plot.luad.expos <- plot_exposures(temp, sort_samples = "SBS4", same_scale = TRUE, annotation="CANCER_TYPE_DETAILED", group_by = "annotation", threshold = 0)
+
+plot.luad.expos <- plot.luad.expos + theme(legend.position = c(0.92, 0.6),
+                                           legend.key.height = unit(0.125, "in"),
+                                           legend.margin = margin(0, 0.05, 0.05, 0.05,
+                                                                  unit = "in"),
+                            strip.background = element_rect(fill = NA,
+                                                            color = "white"),
+                            legend.background = element_rect(fill = "white",
+                                                            color = "black",
+                                                            linetype = 1,
+                                                            linewidth = 0.25),
+                            legend.text = element_text(size = 6),
+                            text=element_text(family="sans")) + 
+                            ylab("Signature activity")
+                            
+plot.luad.expos
+
+```
+
+```{r lung_adeno_sbs4_lm}
+
+# Get index of all samples with complete clinical annotation
+ix = annot$CANCER_TYPE_DETAILED %in% c("Lung Adenocarcinoma") & annot$`SMOKE STATUS` != "Unknown" & annot$AJCC_PATHOLOGIC_TUMOR_STAGE != "Unknown"
+
+# Set up predictor variables
+SBS4 <- log1p(e["SBS4",ix])
+Age <- scale(as.numeric(annot$`DIAGNOSIS AGE`[ix]))
+Sex <- factor(annot$SEX[ix], levels = c("Female", "Male"))
+Smoking_Status <- factor(annot$`SMOKE STATUS`[ix], levels = c("Nonsmoker", "Smoker"))
+Sample_Type <- factor(annot$SAMPLE_TYPE[ix], levels = c("Primary", "Metastasis"))
+Purity <- scale(as.numeric(annot$TUMOR_PURTITY[ix]))
+Stage <- as.factor(annot$AJCC_PATHOLOGIC_TUMOR_STAGE[ix])
+
+# Get EGFR mutations for overlapping samples
+EGFR.status <- mut.table["EGFR",rownames(annot)[ix]] > 0
+EGFR <- factor(ifelse(EGFR.status, "Mutated", "Non-mutated"), levels = c("Non-mutated", "Mutated"))
+
+# Fit linear model
+model <- lm(SBS4 ~ Smoking_Status + Purity + Stage + Age + EGFR + Sample_Type + Sex) 
+summary(model)
+
+# Create a model plot of coefficients
+pval.breaks <- c(0, 0.001, 0.01, 0.05, 1)
+pval.labels <- c("p < 0.001", "p < 0.01", "p < 0.05", "p > 0.05")
+plot.luad.model <- modelplot(model, coef_omit="Intercept", coef_rename = TRUE) + 
+  theme_classic() + 
+  guides(color=guide_legend(title="P-value")) + 
+  theme(legend.spacing = unit(0.01, "in"),
+        legend.text = element_text(size = 6),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.5)) + 
+  aes(color = cut(x = p.value, breaks = pval.breaks, labels = pval.labels)) +
+  scale_color_manual(values = c("red", "red2", "red4", "black"), drop = FALSE) + 
+  geom_vline(xintercept = 0, color = 'grey', linetype = 2) +
+  xlab("Coefficients +/- 95% C.I.") 
+  
+plot.luad.model
+
+# Get the stats for the relationship bewteen Sex and Smoking
+fisher.test(Sex, Smoking_Status)
+
+# Get the stats for the relationship bewteen EGFR and Sex within Smokers
+fisher.test(Sex[Smoking_Status == "Smoker"], EGFR[Smoking_Status == "Smoker"])
+
+# Get the stats for the relationship bewteen EGFR and Sex within Nonsmokers
+fisher.test(Sex[Smoking_Status == "Nonsmoker"], EGFR[Smoking_Status == "Nonsmoker"])
+
+```
+
+```{r lung_adeno_sbs4_clinical}
+
+# Count each om_msk_combination of categories
+dat <- data.frame(Sex, Smoking_Status, EGFR)
+dat.n <- dat %>% group_by_all %>% count
+
+# Create barplot describing the relationship between sex, smoking, and EGFR status 
+plot.luad.bar <- ggplot(dat.n) +
+  geom_bar(aes(x = Sex , y = n, fill = EGFR),
+           position = "stack",
+           stat = "identity") +
+  facet_grid(~ Smoking_Status, switch = "x") +
+  scale_fill_manual(values = c("grey80", "black"), ) +
+  guides(fill=guide_legend(title="EGFR Status")) +
+  theme(strip.placement = "outside",
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white",
+                                        color = "black"),
+        strip.background = element_rect(fill = NA, color = "white"),
+        panel.spacing = unit(-.01,"cm"),
+        legend.key.height = unit(0.125, "in"),
+        legend.position = c(0.25, 0.8),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 6, face = "bold"),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.25)) + 
+  ylab("Sample count") + xlab("") +
+  scale_y_continuous(expand = expansion(mult = c(0, .1)))
+
+plot.luad.bar
+
+```
+
+```{r lung_adeno_sbs4_smoking_sex}
+
+# Create plot of SBS4 as a function of smoking and sex
+
+df <- data.frame(SBS4 = e["SBS4",ix], Sex, Smoking_Status)
+stat.sbs4.1 <- df %>%
+  group_by(Smoking_Status) %>%
+  wilcox_test(SBS4 ~ Sex) %>%
+  add_xy_position(x = "Smoking_Status", group = "Sex", dodge = 0.8)
+stat.sbs4.1
+
+stat.sbs4.2 <- df %>%
+  group_by(Sex) %>%
+  wilcox_test(SBS4 ~ Smoking_Status) %>%
+  add_xy_position(x = "Smoking_Status", group = "Sex")
+stat.sbs4.2
+
+plot.luad.violin <- ggviolin(df, x = "Smoking_Status", y = "SBS4", fill = "Sex", add = "dotplot", add.params = list(dotsize = 0.25, binwidth = 3)) +
+  stat_pvalue_manual(stat.sbs4.1,
+                     tip.length = 0.02,
+                     step.increase = 0.05,
+                     label = "p = {p}") +
+  stat_pvalue_manual(stat.sbs4.2,
+                     tip.length = 0.02,
+                     step.increase = 0.15,
+                     label = "p = {p}") +
+  ylab("SBS4 activity") + xlab("") + 
+  theme(legend.key.height = unit(0.125, "in"),
+        legend.position = c(0.93, 0.85),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 6, face = "bold"),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.25))
+plot.luad.violin
+
+```
+
+```{r lung_adeno_sbs4_plot}
+
+# Save plot
+layout_matrix <- rbind(c(1, 1, 1, 1, 1), c(2, 2, 3, 3, 3), c(4, 4, 4, 5, 5))
+g <- grid.arrange(plot.luad.expos, plot.luad.bar, plot.luad.violin, plot.luad.model, layout_matrix = layout_matrix)
+g
+ggsave(plot = g, filename = "results/SBS4_LUAD.pdf", width = 10, height = 11)
+
+```
+
+# Melanoma Analysis (Figure 5)
+
+```{r Signature activities in melanoma samples}
+
+# Access melanoma samples
+om_cut_samp <- samp_annot(om_result)$Samples[which(grepl("Melanoma", samp_annot(om_result)$CANCER_TYPE))]
+
+res10_cut_mel <- om_result
+res10_cut_mel@exposures <- om_result@exposures[, which(colnames(om_result@exposures) %in% om_cut_samp)]
+
+# plot signature exposures of melanoma samples
+plot_exposures(res10_cut_mel, sort = "SBS7", threshold = 0.00001) + theme(legend.position = c(0.86, 0.6),
+                                           legend.key.height = unit(0.125, "in"),
+                                           legend.margin = margin(0, 0.05, 0.05, 0.05,
+                                                                  unit = "in"),
+                            strip.background = element_rect(fill = NA,
+                                                            color = "white"),
+                            legend.background = element_rect(fill = "white",
+                                                            color = "black",
+                                                            linetype = 1,
+                                                            linewidth = 0.25),
+                            legend.text = element_text(size = 6),
+                            text=element_text(family="sans")) +
+                            ylab("Signature activity") -> A
+
+A
+
+```
+
+```{r Counts/MB in Cutaneous Melanomas}
+
+# Access cutaneous melanomas in each cohort
+mel_comb <- musicatk::subset_musica_by_annotation(combined, "CANCER_TYPE_DETAILED", "Cutaneous Melanoma")
+mel_om <- musicatk::subset_musica_by_annotation(mel_comb, "Cohort", "Origimed")
+mel_msk <- musicatk::subset_musica_by_annotation(mel_comb, "Cohort", "MSK")
+
+om_cr <- 2.6 #megabases capture region (https://www.nature.com/articles/s41467-022-31780-9)
+msk_cr <- 0.95 #megabases capture region Averaging over 1.0, 0.9 values depending on MSK version
+
+om_mat_cut <- mel_om@count_tables$SBS96@count_table
+msk_mat_cut <- mel_msk@count_tables$SBS96@count_table
+
+mb_counts_df <- rbind(cbind(colSums(om_mat_cut)/om_cr, "Origimed"), 
+                   cbind(colSums(msk_mat_cut)/msk_cr, "MSK")) %>% as.data.frame()
+colnames(mb_counts_df) <- c("Count_MB", "Cohort")
+mb_counts_df$Count_MB <- as.numeric(mb_counts_df$Count_MB)
+
+my_comparisons = list(c("MSK", "Origimed"))
+mb_counts_df %>% ggplot(aes(x = Cohort, y = Count_MB, fill = Cohort)) + geom_violin() + scale_x_discrete(labels = c("American (MSK)", "Chinese (OM)")) + theme_bw() + 
+  theme(panel.grid = element_blank(), legend.text = element_text(size = 6), legend.title = element_text(size = 8, face = "bold"), legend.background = element_rect(fill = "white", color = "black", linetype = 1, linewidth = 0.25), legend.position = c(0.85, 0.5)) + 
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+  geom_jitter() + stat_compare_means(comparisons = my_comparisons, vjust = -1, label = "p") + ggtitle("All SBSs") + ylab("SBSs per Mb") + xlab("") +
+  scale_fill_discrete(labels=c("MSK" = "MSK", "Origimed"="OM")) -> B
+
+B
+
+```
+
+```{r C>T Mutations}
+
+basic <- grepl("C>T", rownames(mel_om@count_tables$SBS96@count_table))
+basic_df <- rbind(cbind(colSums(mel_om@count_tables$SBS96@count_table[basic, ])/colSums(mel_om@count_tables$SBS96@count_table), "Origimed"),
+cbind(colSums(mel_msk@count_tables$SBS96@count_table[basic, ])/colSums(mel_msk@count_tables$SBS96@count_table), "MSK")) %>% as.data.frame()
+colnames(basic_df) <- c("Fraction_CT", "Cohort")
+basic_df$Fraction_CT <- as.numeric(basic_df$Fraction_CT)
+basic_df <- basic_df[-which(is.na(basic_df$Fraction_CT)), ]
+basic_df %>% ggplot(aes_string(x = "Cohort", y = "Fraction_CT", fill = "Cohort")) + geom_violin() + 
+  scale_x_discrete(labels = c("American (MSK)", "Chinese (OM)")) + geom_jitter() + theme_bw() + 
+  theme(panel.grid = element_blank(), legend.position = "none") + 
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+  stat_compare_means(comparisons = my_comparisons, vjust = -1) + ggtitle("C>T mutations") + ylab("Fraction of SBSs") + xlab("") -> C
+
+C
+
+```
+
+```{r C>T Mutations at specific contexts}
+
+context <- grepl("T_TCA|C>T_CCC|T_TCT", rownames(mel_om@count_tables$SBS96@count_table))
+context_df <- rbind(cbind(colSums(mel_om@count_tables$SBS96@count_table[context, , drop = FALSE])/colSums(mel_om@count_tables$SBS96@count_table), "Origimed"),
+cbind(colSums(mel_msk@count_tables$SBS96@count_table[context, , drop = FALSE])/colSums(mel_msk@count_tables$SBS96@count_table), "MSK")) %>% as.data.frame()
+colnames(context_df) <- c("Fraction_Multi", "Cohort")
+context_df$Fraction_Multi <- as.numeric(context_df$Fraction_Multi)
+context_df <- context_df[-which(is.na(context_df$Fraction_Multi)), ]
+context_df %>% ggplot(aes_string(x = "Cohort", y = "Fraction_Multi", fill = "Cohort")) + geom_violin() + geom_jitter() + theme_bw() + theme(panel.grid = element_blank(), legend.position = "none") + 
+  scale_x_discrete(labels = c("American (MSK)", "Chinese (OM)")) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+  stat_compare_means(comparisons = my_comparisons, vjust = -1) + ggtitle("C>T mutations at TCA, CCC, or TCT contexts") + 
+  ylab("Fraction of SBSs") + xlab("") -> D
+
+D
+
+```
+
+```{r final plot}
+
+combined_plot <- patchwork::wrap_plots(A, B, C, D, nrow = 2) + patchwork::plot_annotation(tag_levels = "A")  &
+  theme(plot.tag = element_text(face = 'bold', size = 12))
+combined_plot
+ggsave2(combined_plot, filename = "results/SBS7_MEL.pdf", width = 9, height = 6)
+
+```
+
+# SigProfiler vs COSMIC (Supplementary Figure 1)
+
+```{r Compre SigProfiler results to COSMIC}
+
+sigprofiler_sigs <- as.data.frame(read.table(sig_profiler_sigs, header=TRUE, sep="\t"))
+
+rownames(sigprofiler_sigs) <- sigprofiler_sigs[,1]
+sigprofiler_sigs <- sigprofiler_sigs[, c(-1)]
+
+sigprofiler_dummy_res <- om_result
+sigprofiler_dummy_res@signatures <- as.matrix(sigprofiler_sigs)
+
+compare_cosmic <- compare_cosmic_v2(sigprofiler_dummy_res, threshold = 0.84, result_name = "SigProfiler Results")
+
+compare_cosmic
+
+```
+
+# Analysis of SBS4 (Supplementary Figure 2)
+
+```{r lung_sqcc_sbs4_lm}
+
+# Get index of all samples with complete clinical annotation
+ix = annot$CANCER_TYPE_DETAILED %in% c("Lung Squamous Cell Carcinoma") & annot$`SMOKE STATUS` != "Unknown" & annot$AJCC_PATHOLOGIC_TUMOR_STAGE != "Unknown"
+
+# Set up predictor variables
+SBS4 <- log1p(e["SBS4",ix])
+Age <- scale(as.numeric(annot$`DIAGNOSIS AGE`[ix]))
+Sex <- factor(annot$SEX[ix], levels = c("Female", "Male"))
+Smoking_Status <- factor(annot$`SMOKE STATUS`[ix], levels = c("Nonsmoker", "Smoker"))
+Sample_Type <- factor(annot$SAMPLE_TYPE[ix], levels = c("Primary", "Metastasis"))
+Purity <- scale(as.numeric(annot$TUMOR_PURTITY[ix]))
+Stage <- as.factor(annot$AJCC_PATHOLOGIC_TUMOR_STAGE[ix])
+
+# Get EGFR mutations for overlapping samples
+EGFR.status <- mut.table["EGFR",rownames(annot)[ix]] > 0
+EGFR <- factor(ifelse(EGFR.status, "Mutated", "Non-mutated"), levels = c("Non-mutated", "Mutated"))
+
+# Fit linear model
+model.lusc <- lm(SBS4 ~ Smoking_Status + Purity + Stage + Age + EGFR + Sample_Type + Sex) 
+summary(model.lusc)
+
+# Create a model plot of coefficients
+pval.breaks <- c(0, 0.001, 0.01, 0.05, 1)
+pval.labels <- c("p < 0.001", "p < 0.01", "p < 0.05", "p > 0.05")
+plot.lusc.model <- modelplot(model.lusc, coef_omit="Intercept", coef_rename = TRUE, show.legend = TRUE) + 
+  theme_classic() + 
+  guides(color=guide_legend(title="P-value")) + 
+  theme(
+        legend.text = element_text(size = 6),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.5),
+        title = element_text(size = 8)) + 
+  aes(color = cut(x = p.value, breaks = pval.breaks, labels = pval.labels)) +
+  scale_color_manual(values = c("red", "red2", "red4", "black"), drop = FALSE) + 
+  geom_vline(xintercept = 0, color = 'grey', linetype = 2) +
+  xlab("Coefficients +/- 95% C.I.") + ggtitle("Lung Squamous Cell Carcinoma")
+  
+plot.lusc.model
+
+```
+
+```{r lung_sclc_sbs4_lm}
+
+# Get index of all samples with complete clinical annotation
+ix = annot$CANCER_TYPE_DETAILED %in% c("Small Cell Lung Cancer") & annot$`SMOKE STATUS` != "Unknown" & annot$AJCC_PATHOLOGIC_TUMOR_STAGE != "Unknown"
+
+# Set up predictor variables
+SBS4 <- log1p(e["SBS4",ix])
+Age <- scale(as.numeric(annot$`DIAGNOSIS AGE`[ix]))
+Sex <- factor(annot$SEX[ix], levels = c("Female", "Male"))
+Smoking_Status <- factor(annot$`SMOKE STATUS`[ix], levels = c("Nonsmoker", "Smoker"))
+Sample_Type <- factor(annot$SAMPLE_TYPE[ix], levels = c("Primary", "Metastasis"))
+Purity <- scale(as.numeric(annot$TUMOR_PURTITY[ix]))
+Stage <- as.factor(annot$AJCC_PATHOLOGIC_TUMOR_STAGE[ix])
+
+# Get EGFR mutations for overlapping samples
+EGFR.status <- mut.table["EGFR",rownames(annot)[ix]] > 0
+EGFR <- factor(ifelse(EGFR.status, "Mutated", "Non-mutated"), levels = c("Non-mutated", "Mutated"))
+
+# Fit linear model
+model.sclc <- lm(SBS4 ~ Smoking_Status + Purity + Stage + Age + EGFR + Sample_Type + Sex) 
+summary(model.sclc)
+
+# Create a model plot of coefficients
+pval.breaks <- c(0, 0.001, 0.01, 0.05, 1)
+pval.labels <- c("p < 0.001", "p < 0.01", "p < 0.05", "p > 0.05")
+plot.sclc.model <- modelplot(model.sclc, coef_omit="Intercept", coef_rename = TRUE, show.legend = TRUE) + 
+  theme_classic() + 
+  guides(color=guide_legend(title="P-value")) + 
+  theme(
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.5),
+        title = element_text(size = 8)) + 
+  aes(color = cut(x = p.value, breaks = pval.breaks, labels = pval.labels)) +
+  scale_color_manual(values = c("red", "red2", "red4", "black"), drop = FALSE) + 
+  geom_vline(xintercept = 0, color = 'grey', linetype = 2) +
+  xlab("Coefficients +/- 95% C.I.") + ggtitle("Small Cell Lung Cancer")
+  
+plot.sclc.model
+
+```
+
+```{r lung_sbs4_plot_other}
+
+plot.other <- grid.arrange(plot.lusc.model, plot.sclc.model)
+plot.other
+ggsave(plot = plot.other, filename = "results/SBS4_LUSC_SCLC_models.pdf", width = 7, height = 5)
+
+```
+
+# Sex differences in oncogene-negative LUADs (Supplementary Figure 3)
+
+```{r}
+
+# Get index of all samples with complete clinical annotation
+ix = annot$CANCER_TYPE_DETAILED %in% c("Lung Adenocarcinoma") & annot$`SMOKE STATUS` != "Unknown" 
+
+# Set up predictor variables
+SBS4 <- log1p(e["SBS4",ix])
+Age <- scale(as.numeric(annot$`DIAGNOSIS AGE`[ix]))
+Sex <- factor(annot$SEX[ix], levels = c("Female", "Male"))
+Smoking_Status <- factor(annot$`SMOKE STATUS`[ix], levels = c("Nonsmoker", "Smoker"))
+Sample_Type <- factor(annot$SAMPLE_TYPE[ix], levels = c("Primary", "Metastasis"))
+Purity <- scale(as.numeric(annot$TUMOR_PURTITY[ix]))
+Stage <- as.factor(annot$AJCC_PATHOLOGIC_TUMOR_STAGE[ix])
+
+# Get oncogene status for overlapping samples
+EGFR.status <- mut.table["EGFR",rownames(annot)[ix]] > 0
+KRAS.status <- mut.table["KRAS",rownames(annot)[ix]] > 0
+BRAF.status <- mut.table["BRAF",rownames(annot)[ix]] > 0
+MET.status <- mut.table["MET",rownames(annot)[ix]] > 0 
+ERBB2.status <- mut.table["ERBB2",rownames(annot)[ix]] > 0 
+MAP2K1.status <- mut.table["MAP2K1",rownames(annot)[ix]] > 0 
+RAF1.status <- mut.table["RAF1",rownames(annot)[ix]] > 0 
+NRAS.status <- mut.table["NRAS",rownames(annot)[ix]] > 0 
+ARAF.status <- mut.table["ARAF",rownames(annot)[ix]] > 0 
+HRAS.status <- mut.table["HRAS",rownames(annot)[ix]] > 0 
+
+onc.status <- EGFR.status
+
+for (i in 1:length(onc.status)){
+  if (EGFR.status[i] > 0 || KRAS.status[i] > 0 || BRAF.status[i] > 0 || MET.status[i] > 0 ||
+      ERBB2.status[i] > 0 || MAP2K1.status[i] > 0 || RAF1.status[i] > 0 || NRAS.status[i] > 0 ||
+      ARAF.status[i] > 0 || HRAS.status[i] > 0){
+    onc.status[i] <- TRUE
+  }
+  else{
+    onc.status[i] <- FALSE
+  }
+}
+  
+onc <- factor(ifelse(onc.status, "Positive", "Negative"), levels = c("Negative", "Positive"))
+
+dat <- data.frame(Sex, Smoking_Status, onc)
+dat.n <- dat %>% group_by_all %>% count
+
+# Create barplot describing the relationship between sex, smoking, and Ras/Raf/RTK Oncogene status 
+plot.luad.bar <- ggplot(dat.n) +
+  geom_bar(aes(x = Sex , y = n, fill = onc),
+           position = "stack",
+           stat = "identity") +
+  facet_grid(~ Smoking_Status, switch = "x") +
+  scale_fill_manual(values = c("grey80", "black"), ) +
+  guides(fill=guide_legend(title="Ras/Raf/RTK Oncogene Status")) +
+  theme(strip.placement = "outside",
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white",
+                                        color = "black"),
+        strip.background = element_rect(fill = NA, color = "white"),
+        panel.spacing = unit(-.01,"cm"),
+        legend.key.height = unit(0.125, "in"),
+        legend.position = c(0.25, 0.8),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 6, face = "bold"),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.25)) + 
+  ylab("Sample count") + xlab("") +
+  scale_y_continuous(expand = expansion(mult = c(0, .1)))
+
+plot.luad.bar
+
+```
+
+```{r}
+
+# boxplot showing the SBS4 activity differences between these groups 
+
+df <- data.frame(SBS4 = e["SBS4",ix], Sex, Smoking_Status, onc.status)
+df <- df[df$onc.status == FALSE,]
+df2 <- df[df$Sex == "Male",]
+stat.sbs4.1 <- df2 %>%
+ wilcox_test(SBS4 ~ Smoking_Status) %>%
+ add_xy_position(x = "Smoking_Status", dodge = 0.8)
+stat.sbs4.1
+
+plot.luad.violin1 <- ggviolin(df2, x = "Smoking_Status", y = "SBS4", fill = "Sex", 
+                             add = "dotplot", add.params = list(dotsize = 0.25, binwidth = 3)) +
+  stat_pvalue_manual(stat.sbs4.1,
+                     tip.length = 0.02,
+                     step.increase = 0.05,
+                     label = "p = {p}") +
+  scale_fill_manual(values=c("#00BFC4")) +
+  ylab("SBS4 activity") + xlab("") + 
+  ggtitle("Oncogene negative tumors") +
+  theme(legend.key.height = unit(0.125, "in"),
+        legend.position = c(0.93, 0.85),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 6, face = "bold"),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.25))
+plot.luad.violin1
+
+df2 <- df[df$Smoking_Status == "Nonsmoker",]
+stat.sbs4.1 <- df2 %>%
+ wilcox_test(SBS4 ~ Sex) %>%
+ add_xy_position(x = "Sex", dodge = 0.8)
+stat.sbs4.1
+
+plot.luad.violin2 <- ggviolin(df2, x = "Sex", y = "SBS4", fill = "Sex", 
+                              add = "dotplot", add.params = list(dotsize = 0.25, binwidth = 3)) +
+  stat_pvalue_manual(stat.sbs4.1,
+                     tip.length = 0.02,
+                     step.increase = 0.05,
+                     label = "p = {p}") +
+  scale_fill_manual(values=c("#F8766D", "#00BFC4")) +
+  scale_x_discrete(labels = c("Female" = "Nonsmoker",
+                              "Male" = "Nonsmoker")) +
+  ylab("SBS4 activity") + xlab("") + 
+  ggtitle("Oncogene negative tumors") +
+  theme(legend.key.height = unit(0.125, "in"),
+        legend.position = c(0.93, 0.85),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 6, face = "bold"),
+        legend.background = element_rect(fill = "white",
+                                         color = "black",
+                                         linetype = 1,
+                                         linewidth = 0.25))
+plot.luad.violin2
+
+```
+
+```{r save plot}
+
+# Save plot
+layout_matrix <- rbind(c(1, 1, 1, 1), c(2, 2, 3, 3))
+g <- grid.arrange(plot.luad.bar, plot.luad.violin1, plot.luad.violin2, layout_matrix = layout_matrix)
+ggsave(plot = g, filename = "results/LUAD_oncogene_negative_analysis.pdf", width = 10, height = 8)
+
+```
+
+# SigProfiler discovered signatures (Supplementary Table 2)
+
+```{r Discovered sgnatures from SigProfiler}
+
+write.table(sigprofiler_sigs, file='results/Supplementary_Table1.tsv', quote=FALSE, sep='\t', col.names = NA)
+
+```
+
+# SigProfiler discovered signature exposures (Supplementary Table 3)
+
+```{r SigProfiler discovered signature exposures}
+
+sigprofiler_exposures <- read.table(sig_profiler_exposures, header=TRUE, sep="\t")
+write.table(sigprofiler_exposures, file='results/Supplementary_Table2.tsv', quote=FALSE, sep='\t', col.names = NA)
+
+```
+
+# Full annotation and exposure data for all samples (Supplementary Table 4)
+
+```{r}
+
+table <- om_result@musica@sample_annotations
+order <- c(2,1,3:16)
+table <- table[, order]
+
+order <- c(table[,1])
+all_exposures <- t(om_result@exposures)
+all_exposures <- all_exposures[order,]
+
+table <- cbind(table, all_exposures)
+
+order <- c(1:16, 17, 23, 29:32, 18:22, 24:28)
+table <- table[, order]
+
+rownames(table) <- c(1:length(table[,1]))
+
+write.table(table, file='results/Supplementary_Table3.tsv', quote=FALSE, sep='\t', col.names = NA)
+
+```
+# Summary table of bubble plot data (Supplementary Table 5)
+
+```{r}
+
+# create table from  table used for bubble plot
+summary_table <- (final_table_select1)
+summary_table <- summary_table[, c(1,2,3,4,5)]
+colnames(summary_table) <- c("Tumor Type", "Signature", "Mean Signature Activity", "Fraction of Tumors with Detected Signature", "Total Number of Tumors")
+summary_table$"Number of Tumors with Detected Signature" <- NA
+summary_table <- summary_table[, c(1, 2, 5, 6, 4, 3)]
+
+# determine number of samples with signature active for given tumor type and signature
+get_num_active <- function(tumor_type, signature){
+  temp <- om_result
+  temp@musica <- subset_musica_by_annotation(temp@musica, "CANCER_TYPE", tumor_type)
+  temp@exposures <- temp@exposures[, as.character(samp_annot(temp)$Samples)]
+  exp <- exposures(temp)
+  num_active <- length(exp[signature,exp[signature,] >= 10])
+  return(num_active)
+}
+
+for (i in 1:dim(summary_table)[1]){
+  summary_table[i,4] <- get_num_active(summary_table[i,1], summary_table[i,2])
+}
+
+# reorder
+summary_table$Signature <- as.numeric(gsub("Signature", "", summary_table$Signature))
+summary_table <- summary_table[order(summary_table$`Tumor Type`, summary_table$Signature ),]
+
+write.table(summary_table, file='results/Supplementary_Table4.tsv', quote=FALSE, sep='\t', col.names = NA)
+
+```
+
+
+# Differences in proportion of samples with high signature activity between cohorts (Supplementary Table 7)
+```{r FIsher comparison between OM and MSK}
+
+write.table(final_fisher_table, file='results/Supplementary_Table6.tsv', quote=FALSE, sep='\t', col.names = NA)
+
+```
+# Differences in mutational signature activities between cohorts (Supplementary Table 8)
+```{r Comparison between OM and MSK}
+
+write.table(final_table, file='results/Supplementary_Table7.tsv', quote=FALSE, sep='\t', col.names = NA)
+
+```
+
+
+
+
